@@ -17,13 +17,16 @@ import Data.List (intercalate)
 import Data.HashMap.Strict (HashMap)
 import Data.String.Here
 import Data.Text (Text)
+import Data.Vector (Vector)
 import System.Exit (exitFailure)
 import System.IO (hPutStrLn, stderr)
 
+import qualified System.Directory
 import qualified Data.HashMap.Strict as HM
 import qualified Data.ByteString.Lazy as LBS
 import qualified Data.Aeson as Json
 import qualified Data.Text as Text
+import qualified Data.Vector as Vector
 
 import Elm2Nix.FixedOutput (FixedDerivation(..), prefetch)
 import Elm2Nix.PackagesSnapshot (snapshot)
@@ -67,13 +70,35 @@ parseElmJsonDeps depsKey obj =
     parseDeps (Object hm) = mapM (uncurry parseDep) (HM.toList hm)
     parseDeps v           = Left (UnexpectedValue v)
 
+tryLookup :: HashMap Text Value -> Text -> Either Elm2NixError Value
+tryLookup hm key = maybeToRight (KeyNotFound key) (HM.lookup key hm)
+  where
     maybeToRight :: b -> Maybe a -> Either b a
     maybeToRight _ (Just x) = Right x
     maybeToRight y Nothing  = Left y
 
-    tryLookup :: HashMap Text Value -> Text -> Either Elm2NixError Value
-    tryLookup hm key =
-      maybeToRight (KeyNotFound key) (HM.lookup key hm)
+parseElmJsonSrcs :: Value -> Either Elm2NixError (Vector FilePath)
+parseElmJsonSrcs obj =
+  case obj of
+    Object hm -> do
+      case tryLookup hm "source-directories" of
+          Left _            -> Right Vector.empty
+          Right (Array vec) -> mapM extractSrcPath vec
+          Right v           -> Left (UnexpectedValue v)
+    v -> Left $ UnexpectedValue v
+  where
+    extractSrcPath :: Value -> Either Elm2NixError String
+    extractSrcPath val =
+      case val of
+          String text -> Right (toNixPath (Text.unpack text))
+          v -> Left (UnexpectedValue v)
+
+    toNixPath :: FilePath -> FilePath
+    toNixPath path =
+      case path of
+          "."       -> "./."
+          p@('.':_) -> p
+          p         -> "./" <> p
 
 -- CMDs
 
@@ -91,20 +116,50 @@ convert = runCLI $ do
   liftIO (putStrLn (generateNixSources sources))
 
 initialize :: IO ()
-initialize = runCLI $
+initialize = runCLI $ do
+  liftIO (hPutStrLn stderr "Resolving elm.json source directories into Nix paths...")
+  res <- liftIO (fmap Json.eitherDecode (LBS.readFile "elm.json"))
+  elmJson <- either (throwErr . ElmJsonReadError) return res
+
+  srcs' <- either throwErr return (parseElmJsonSrcs elmJson)
+  liftIO (hPutStrLn stderr $ "Using source directories:")
+  liftIO (mapM (hPutStrLn stderr) srcs')
+  let srcs = stringifySrcs srcs'
+  srcdir <- liftIO (getSrcDir srcs')
+
   liftIO (putStrLn [template|data/default.nix|])
   where
     -- | Converts Package.Name to Nix friendly name
     baseName :: Text
     baseName = "elm-app"
+
     version :: Text
     version = "0.1.0"
+
     toNixName :: Text -> Text
     toNixName = Text.replace "/" "-"
+
     name :: String
     name = Text.unpack (toNixName baseName <> "-" <> version)
-    srcdir :: String
-    srcdir = "./src" -- TODO: get from elm.json
+
+    getSrcDir :: Vector FilePath -> IO FilePath
+    getSrcDir dirs
+      | Vector.null dirs = pure "./src"
+      | "./." `Vector.elem` dirs || "."  `Vector.elem` dirs =
+          -- Nix creates dir named after current directory if `srcs` contains `./.`
+        lastDir <$> liftIO System.Directory.getCurrentDirectory
+      | otherwise =
+          -- Can't fail as there is case for Vec.null!
+          pure (Vector.head dirs)
+
+    lastDir :: FilePath -> FilePath
+    lastDir = foldl (\path c -> if c == '/' then "" else path <> [c]) ""
+
+    stringifySrcs :: Vector FilePath -> String
+    stringifySrcs xs =
+      "[\n"
+      <> foldr (\i acc -> "    " <> i <> "\n" <> acc) "" xs
+      <> "  ]"
 
 -- Utils
 
